@@ -7,7 +7,7 @@
 #RACE=
 
 # comment this to run the tests without the Go race detector.
-RACE=-race
+# RACE=-race
 
 # run the test in a fresh sub-directory.
 rm -rf mr-tmp
@@ -84,6 +84,8 @@ timeout -k 2s 180s ../mrcoordinator ../pg*txt &
 sleep 1
 
 # start multiple workers
+# timeout -k 2s 180s ../mrworker ../../mrapps/indexer.so >> work1.log 2>&1 &
+# timeout -k 2s 180s ../mrworker ../../mrapps/indexer.so >> work2.log 2>&1
 timeout -k 2s 180s ../mrworker ../../mrapps/indexer.so &
 timeout -k 2s 180s ../mrworker ../../mrapps/indexer.so
 
