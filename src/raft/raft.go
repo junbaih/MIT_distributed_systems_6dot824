@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"fmt"
 	"math/rand"
 	"reflect"
 	"sync"
@@ -101,7 +102,7 @@ type Raft struct {
 }
 
 type ServerState struct {
-	state          ServerStateEnum
+	State          ServerStateEnum
 	rf             *Raft
 	killedCh       chan int8
 	stateChangedCh chan int8
@@ -110,7 +111,7 @@ type ServerState struct {
 func (s *ServerState) isStateChanged() bool {
 	s.rf.mu.Lock()
 	defer s.rf.mu.Unlock()
-	return reflect.ValueOf(s.rf.state).FieldByName("state").Interface().(ServerStateEnum) != s.state
+	return reflect.ValueOf(s.rf.state).Elem().FieldByName("State").Interface().(ServerStateEnum) != s.State
 }
 
 type ProcessableState interface {
@@ -135,6 +136,7 @@ type LeaderState struct {
 }
 
 type LogItem struct {
+	Term int
 }
 
 // return currentTerm and whether this server
@@ -144,6 +146,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	term = rf.currentTerm
+	isleader = reflect.ValueOf(rf.state).Elem().FieldByName("State").Interface().(ServerStateEnum) == Leader
 	return term, isleader
 }
 
@@ -239,8 +243,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	replyCh := make(chan RequestVoteReply, 1)
 	req := localRequestVoteArgs{RequestVoteArgs: *args, replyCh: replyCh}
-	rf.requestVoteReqCh <- req
+	fmt.Printf("%v handling RequestVote %v\n", rf.me, *args)
+	// fmt.Printf("%v handling RequestVote %v, spawning goroutine\n", rf.me, *args)
+
+	go func() {
+		rf.requestVoteReqCh <- req
+		fmt.Printf("%v add to reqChan %v, chan %v\n", rf.me, req, rf.requestVoteReqCh)
+	}()
+
 	localReply := <-replyCh
+	fmt.Printf("%v receives from local reply chan res %v\n", rf.me, localReply)
+
 	reply.Granted = localReply.Granted
 	reply.Term = localReply.Term
 }
@@ -303,7 +316,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	fmt.Printf("%v requests vote from %v for term %v\n", rf.me, server, args.Term)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	fmt.Printf("%v receives vote response OK=%v from %v, %v for term %v\n", rf.me, ok, server, *reply, args.Term)
+
 	return ok
 }
 
@@ -400,6 +416,7 @@ func (rf *Raft) toLeaderState() {
 	rf.leaderState.matchIndex = make([]int, len(rf.peers))
 
 	rf.leaderState.nextIndex = make([]int, len(rf.peers))
+
 	for i := range rf.peers {
 		rf.leaderState.nextIndex[i] = len(rf.log) + 1
 	}
@@ -412,9 +429,12 @@ func (rf *Raft) toLeaderState() {
 func (f *FollowerState) processEvents() {
 	rf := f.rf
 	electionTimeout := time.NewTimer(rf.getElectionTimeout())
+	defer electionTimeout.Stop()
 	// for _ = range electionTimeout.C {
 	// 	rf.toCandidateState()
 	// }
+	fmt.Printf("%v is in follower state, process Events, for term %v\n", rf.me, rf.currentTerm)
+
 	for {
 		select {
 		case <-electionTimeout.C:
@@ -422,14 +442,38 @@ func (f *FollowerState) processEvents() {
 			return
 			// TODO case AppendLogs
 		case voteReq := <-rf.requestVoteReqCh:
+			fmt.Printf("%v is a follower, process voteReq %v\n", rf.me, voteReq)
 			if voteReq.Term > rf.currentTerm {
+				fmt.Printf("%v term is lagging, currently at %v, inc to %v\n", rf.me, rf.currentTerm, voteReq.Term)
 				rf.currentTerm = voteReq.Term
 				rf.votedFor = -1
+
 			}
 			if rf.canVoteFor(voteReq) {
+				fmt.Printf("%v vote for %v at term %v\n", rf.me, voteReq.CandidateId, rf.currentTerm)
+
 				voteReq.replyCh <- RequestVoteReply{Term: rf.currentTerm, Granted: true}
+				rf.votedFor = voteReq.CandidateId
+				electionTimeout.Reset(rf.getElectionTimeout())
 			} else {
+				fmt.Printf("%v REFUSE to vote for %v for term %v, bc voted for %v at term %v\n", rf.me, voteReq.CandidateId, voteReq.Term, rf.votedFor, rf.currentTerm)
+
 				voteReq.replyCh <- RequestVoteReply{Term: rf.currentTerm, Granted: false}
+			}
+		case appendEntriesReq := <-rf.appendEntriesReqCh:
+			if appendEntriesReq.Term < rf.currentTerm { // leader outdated
+				appendEntriesReq.replyCh <- AppendEntriesReply{Success: false, Term: rf.currentTerm}
+			} else {
+				if appendEntriesReq.Term > rf.currentTerm {
+					rf.currentTerm = appendEntriesReq.Term
+					rf.votedFor = -1
+				} else if !rf.canAppendEntries(appendEntriesReq) {
+					appendEntriesReq.replyCh <- AppendEntriesReply{Success: false, Term: rf.currentTerm}
+				} else {
+					// TODO do append entries
+
+				}
+				electionTimeout.Reset(rf.getElectionTimeout())
 			}
 		}
 	}
@@ -437,7 +481,7 @@ func (f *FollowerState) processEvents() {
 
 func (c *CandidateState) startElection() {
 	rf := c.rf
-	req := &RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me, LastLogIndex: len(rf.log), LastLogTerm: rf.lastLogTerm} // TODO
+	req := &RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me, LastLogIndex: len(rf.log), LastLogTerm: rf.lastLogTerm}
 
 	for i := range rf.peers {
 		if i != rf.me {
@@ -456,42 +500,77 @@ func (c *CandidateState) startElection() {
 func (c *CandidateState) processEvents() {
 	rf := c.rf
 	voteCnt := 1
+	fmt.Printf("%v is in Candidate state, process Events, for term %v\n", rf.me, rf.currentTerm)
 	rf.candidateState.startElection()
 
-	electionTimeout := time.NewTimer(time.Millisecond * rf.getElectionTimeout())
+	electionTimeout := time.NewTimer(rf.getElectionTimeout())
 	defer electionTimeout.Stop()
 
 	for {
 		select {
 		case <-c.killedCh:
 			return
-		case <-c.stateChangedCh:
-			go func() {
-				for {
-					select {
-					case <-c.voteResult:
-					default:
-						return
-					}
-				}
-			}()
-			return
+		// case <-c.stateChangedCh:
+		// 	go func() {
+		// 		for {
+		// 			select {
+		// 			case <-c.voteResult:
+		// 			default:
+		// 				return
+		// 			}
+		// 		}
+		// 	}()
+		// 	return
 		case vote := <-c.voteResult:
+			fmt.Printf("%v receives vote response %v\n", rf.me, vote)
 			if vote.Term > rf.currentTerm {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
+				// rf.mu.Lock()
+				// defer rf.mu.Unlock()
+				fmt.Printf("%v is at term %v, but now is term %v, converting to follower from Candidate\n", rf.me, rf.currentTerm, vote.Term)
+
 				rf.toFollowerState(vote.Term)
 				return
 			} else if vote.Term == rf.currentTerm && vote.Granted {
 				voteCnt += 1
 				if voteCnt >= len(rf.peers)/2+1 {
+
 					rf.toLeaderState()
+					fmt.Printf("%v to leader for term %v\n", rf.me, rf.currentTerm)
+
 					return
 				}
 			}
 		case <-electionTimeout.C:
+			fmt.Printf("Candidate %v elec timeout for term %v, moving to term %v\n", rf.me, rf.currentTerm, rf.currentTerm+1)
 			rf.toCandidateState(rf.currentTerm + 1)
+
 			return
+		case voteReq := <-rf.requestVoteReqCh:
+			fmt.Printf("%v is a Candidate, process voteReq %v\n", rf.me, voteReq)
+
+			if voteReq.Term > rf.currentTerm {
+				rf.toFollowerState(voteReq.Term)
+				fmt.Printf("%v is a Candidate, process voteReq %v before send to channel\n", rf.me, voteReq)
+				go func() {
+					rf.requestVoteReqCh <- voteReq
+				}()
+				fmt.Printf("%v is a Candidate, process voteReq %v after send to channel\n", rf.me, voteReq)
+
+				return
+			} else {
+				voteReq.replyCh <- RequestVoteReply{Term: rf.currentTerm, Granted: false}
+			}
+		case appendEntriesReq := <-rf.appendEntriesReqCh:
+			if appendEntriesReq.Term >= rf.currentTerm {
+				rf.toFollowerState(appendEntriesReq.Term)
+
+				go func() {
+					rf.appendEntriesReqCh <- appendEntriesReq
+				}()
+				return
+			} else {
+				appendEntriesReq.replyCh <- AppendEntriesReply{Success: false, Term: rf.currentTerm}
+			}
 		}
 	}
 
@@ -522,8 +601,8 @@ func (l *LeaderState) heartBeat() {
 	for {
 		select {
 		case <-pulse.C:
-			req := &AppendEntriesArgs{}
 			for i := range rf.peers {
+				req := &AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex: l.nextIndex[i] - 1, PrevLogTerm: rf.lastLogTerm, LeaderCommit: rf.commitIndex} // TODO
 				res := &AppendEntriesReply{}
 				if i != rf.me {
 					go func(i int) {
@@ -546,6 +625,8 @@ func (l *LeaderState) heartBeat() {
 func (l *LeaderState) processEvents() {
 	go l.heartBeat()
 	rf := l.rf
+	fmt.Printf("%v is in Leader state, process Events, for term %v\n", rf.me, rf.currentTerm)
+
 	for {
 		select {
 		case killed := <-l.killedCh:
@@ -559,20 +640,35 @@ func (l *LeaderState) processEvents() {
 				rf.toFollowerState(res.Term)
 				return
 			}
+			// TODO decrease nextIndex
+		case voteReq := <-rf.requestVoteReqCh:
+			fmt.Printf("%v is leader for term %v, but now asked to vote %v for term %v", rf.me, rf.currentTerm, voteReq.CandidateId, voteReq.Term)
+
+			if voteReq.Term > rf.currentTerm {
+				fmt.Printf("%v is leader for term %v, but now asked to vote %v for term %v, converting to follower", rf.me, rf.currentTerm, voteReq.CandidateId, voteReq.Term)
+				rf.toFollowerState(voteReq.Term)
+				fmt.Printf("%v was a leader, process voteReq %v before send to channel\n", rf.me, voteReq)
+
+				go func() {
+					rf.requestVoteReqCh <- voteReq
+					fmt.Printf("%v was a Candidate, process voteReq %v after send to channel\n", rf.me, voteReq)
+				}()
+				return
+			} else {
+				voteReq.replyCh <- RequestVoteReply{Term: rf.currentTerm, Granted: false}
+			}
+		case appendEntriesReq := <-rf.appendEntriesReqCh:
+			if appendEntriesReq.Term > rf.currentTerm {
+				rf.toFollowerState(appendEntriesReq.Term)
+				go func() {
+					rf.appendEntriesReqCh <- appendEntriesReq
+				}()
+				return
+			} else {
+				appendEntriesReq.replyCh <- AppendEntriesReply{Success: false, Term: rf.currentTerm}
+			}
 		}
 	}
-}
-
-func (rf *Raft) setTerm(t int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.currentTerm = t
-}
-
-func (rf *Raft) getTerm(t int) int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.currentTerm
 }
 
 func (rf *Raft) canVoteFor(req localRequestVoteArgs) bool {
@@ -580,6 +676,17 @@ func (rf *Raft) canVoteFor(req localRequestVoteArgs) bool {
 	notVotedCheck := rf.votedFor == -1 || rf.votedFor == req.CandidateId
 	upToDateCheck := rf.lastLogTerm < req.LastLogTerm || (rf.lastLogTerm == req.LastLogTerm && len(rf.log) <= req.LastLogIndex)
 	return termCheck && notVotedCheck && upToDateCheck
+}
+
+func (rf *Raft) canAppendEntries(req localAppendEntriesArgs) bool {
+	termCheck := req.Term == rf.currentTerm
+	var logCheck bool
+	if req.PrevLogIndex == 0 {
+		logCheck = len(rf.log) == 0
+	} else {
+		logCheck = len(rf.log) >= req.PrevLogIndex && rf.log[req.PrevLogIndex-1].Term == req.PrevLogTerm
+	}
+	return termCheck && logCheck
 }
 
 //
@@ -617,10 +724,12 @@ func (r *Raft) initServerState() {
 	r.votedFor = -1
 	r.commitIndex = 0
 	r.lastApplied = 0
-	r.leaderState = &LeaderState{}
-	r.candidateState = &CandidateState{ServerState: &ServerState{rf: r, state: Candidate}, voteResult: make(chan *RequestVoteReply)}
-	r.followerState = &FollowerState{ServerState: &ServerState{state: Follower, rf: r}, lastHeartBeatTime: time.Now()}
+	r.leaderState = &LeaderState{ServerState: &ServerState{rf: r, State: Leader}}
+	r.candidateState = &CandidateState{ServerState: &ServerState{rf: r, State: Candidate}, voteResult: make(chan *RequestVoteReply)}
+	r.followerState = &FollowerState{ServerState: &ServerState{State: Follower, rf: r}, lastHeartBeatTime: time.Now()}
 	// r.state = r.followerState
+	r.requestVoteReqCh = make(chan localRequestVoteArgs)
+	r.appendEntriesReqCh = make(chan localAppendEntriesArgs)
 	r.toFollowerState(0)
 
 }
